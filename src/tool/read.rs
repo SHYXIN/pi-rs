@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 
-use super::{ToolContext, ToolExecutor, ToolOutput};
+use super::{Tool, ToolContext, ToolExecutor, ToolOutput};
 
 /// read 工具执行器。
 ///
@@ -15,6 +15,25 @@ use super::{ToolContext, ToolExecutor, ToolOutput};
 /// 本 ticket 只交付「内容为字符串」的核心语义，行号截取用最简实现
 /// （offset 之前丢弃、按 limit 截取），富格式化留给后续追平 pi 的 ticket。
 pub struct ReadTool;
+
+impl ReadTool {
+    /// 工具声明；schema 与实现同文件演进，避免两处漂移（对齐 bash/edit/grep）。
+    pub fn declaration() -> Tool {
+        Tool {
+            name: "read".into(),
+            description: "Read a file's content from disk".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "File path to read"},
+                    "offset": {"type": "integer", "description": "Line number to start reading from (1-based)"},
+                    "limit": {"type": "integer", "description": "Maximum number of lines to read"}
+                },
+                "required": ["file_path"]
+            }),
+        }
+    }
+}
 
 #[async_trait]
 impl ToolExecutor for ReadTool {

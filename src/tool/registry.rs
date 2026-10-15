@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use super::{Tool, ToolContext, ToolExecutor, ToolOutput};
+use super::{ToolContext, ToolExecutor, ToolOutput};
 
 /// 注册表中的条目：工具声明（暴露给 LLM 的元数据）+ 执行器。
 pub struct RegistryEntry {
@@ -111,6 +111,27 @@ impl ToolRegistry {
     }
 }
 
+/// 第一版完整五件套（GLOSSARY.md First Version Boundary：read/bash/edit/write/grep）
+/// 的一步式构建入口：声明取自各工具的 `declaration()`，执行器与之同文件，
+/// 保证 schema 与行为不漂移。当前只被测试与后续 agent loop 接线使用。
+#[allow(dead_code)]
+pub fn default_registry() -> ToolRegistry {
+    use super::{BashTool, EditTool, GrepTool, ReadTool, WriteTool};
+
+    let mut reg = ToolRegistry::new();
+    let five = [
+        (ReadTool::declaration(), std::sync::Arc::new(ReadTool) as std::sync::Arc<dyn ToolExecutor>),
+        (WriteTool::declaration(), std::sync::Arc::new(WriteTool) as std::sync::Arc<dyn ToolExecutor>),
+        (EditTool::declaration(), std::sync::Arc::new(EditTool) as std::sync::Arc<dyn ToolExecutor>),
+        (BashTool::declaration(), std::sync::Arc::new(BashTool) as std::sync::Arc<dyn ToolExecutor>),
+        (GrepTool::declaration(), std::sync::Arc::new(GrepTool) as std::sync::Arc<dyn ToolExecutor>),
+    ];
+    for (tool, executor) in five {
+        reg.register(tool, executor).expect("default tools have unique names");
+    }
+    reg
+}
+
 /// 注册表的执行入口本质上就是 ToolExecutor（方便把整个注册表当单个工具集使用）。
 #[async_trait]
 impl ToolExecutor for ToolRegistry {
@@ -130,6 +151,64 @@ mod tests {
     use super::*;
     use crate::tool::{ReadTool, Tool, WriteTool};
     use serde_json::json;
+
+    #[test]
+    fn default_registry_has_complete_five_tools() {
+        let reg = default_registry();
+        assert_eq!(reg.len(), 5);
+        let names: Vec<String> = reg.tools().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["bash", "edit", "grep", "read", "write"]);
+    }
+
+    #[tokio::test]
+    async fn default_registry_validates_args_for_new_tools() {
+        // 三件新工具的 schema 校验生效：缺 required 字段返回 ValidationFailed
+        let reg = default_registry();
+        let ctx = ToolContext::new(".");
+
+        let out = reg.execute("bash", json!({}), &ctx).await.unwrap();
+        match out {
+            ToolOutput::ValidationFailed(msg) => assert!(msg.contains("command"), "{msg}"),
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+
+        let out = reg
+            .execute("edit", json!({"file_path": "a.txt"}), &ctx)
+            .await
+            .unwrap();
+        match out {
+            ToolOutput::ValidationFailed(msg) => {
+                assert!(msg.contains("old") || msg.contains("new"), "{msg}")
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+
+        let out = reg.execute("grep", json!({}), &ctx).await.unwrap();
+        match out {
+            ToolOutput::ValidationFailed(msg) => assert!(msg.contains("pattern"), "{msg}"),
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_registry_end_to_end_edit_via_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "alpha beta\n").unwrap();
+        let reg = default_registry();
+        let out = reg
+            .execute(
+                "edit",
+                json!({"file_path": "f.txt", "old": "beta", "new": "gamma"}),
+                &ToolContext::new(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_success(), "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "alpha gamma\n"
+        );
+    }
 
     fn dummy_tool(name: &str) -> Tool {
         Tool {
