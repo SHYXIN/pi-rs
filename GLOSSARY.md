@@ -26,4 +26,8 @@ LLM 在回复中发出的一次工具使用请求（工具名 + 参数）。由 
 
 ## First Version Boundary（第一版边界）
 
-第一版的完成定义：单 provider + 核心工具集（read/bash/edit/write/grep）+ agent loop + 基础终端 REPL，能真实完成代码修改任务。TUI 富渲染、MCP、多 provider 均在边界之外。
+第一版的完成定义：单 provider + 核心工具集（read/bash/edit/write/grep）+ agent loop + 基础终端 REPL（多行输入 + ANSI 着色），能真实完成代码修改任务。与 pi 的差距（TUI 富渲染、MCP、codemode、durable、多 provider、extension 机制）是后续演进方向，不在第一版边界内。
+
+## Provider Parity Principle（Provider 对齐原则）
+
+以原版 pi 的能力全集为参照系，但第一版只在单 provider（OpenAI 兼容协议）上做穿核心链路；其余能力按「先穿通、再补齐」的顺序逐个 ticket 追平。范围对齐 pi 全集，节奏上允许长期追赶。
