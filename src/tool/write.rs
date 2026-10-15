@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 
-use super::{ToolContext, ToolExecutor, ToolOutput};
+use super::{Tool, ToolContext, ToolExecutor, ToolOutput};
 
 /// write 工具执行器。
 ///
@@ -12,6 +12,24 @@ use super::{ToolContext, ToolExecutor, ToolOutput};
 ///
 /// 成功输出写入的字节数（UTF-8）。
 pub struct WriteTool;
+
+impl WriteTool {
+    /// 工具声明；schema 与实现同文件演进，避免两处漂移（对齐 bash/edit/grep）。
+    pub fn declaration() -> Tool {
+        Tool {
+            name: "write".into(),
+            description: "Write content to a file (overwrites; creates parent directories)".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Target file path"},
+                    "content": {"type": "string", "description": "Full content to write"}
+                },
+                "required": ["file_path", "content"]
+            }),
+        }
+    }
+}
 
 #[async_trait]
 impl ToolExecutor for WriteTool {

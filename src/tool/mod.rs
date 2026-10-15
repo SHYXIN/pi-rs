@@ -6,15 +6,21 @@
 //! - `ToolRegistry` 注册表（按名注册 / 查找）
 //! - 参数 JSON Schema 轻量校验（`validate_args`）
 //!
-//! 第一版边界内的五个工具（read/bash/edit/write/grep）中，
-//! 本 ticket 只接 read / write 两个实现；bash/edit/grep 的 schema
-//! 声明保留在 `crate::config::default_tools()`，实现在后续 ticket。
+//! 第一版边界内的五个工具（read/bash/edit/write/grep）已全部实现并
+//! 接入注册表；schema 声明与实现同文件演进（各工具的 `declaration()`），
+//! `crate::config::default_tools()` 保留为兼容入口。
 
+mod bash;
+mod edit;
+mod grep;
 mod read;
 mod registry;
 mod validate;
 mod write;
 
+pub use bash::BashTool;
+pub use edit::EditTool;
+pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use registry::{ToolRegistry, ToolRegistryError};
 pub use validate::{validate_args, ValidationError};
