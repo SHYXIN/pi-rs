@@ -12,6 +12,9 @@ serde_json = "1"
 # 错误处理选 thiserror 而非 anyhow：config 等模块是库代码，调用方（后续 agent loop）
 # 需要区分「配置缺失 / 解析失败 / 模型不存在」等可匹配的错误变体，而非笼统的应用错误
 thiserror = "2"
+# async trait：ToolExecutor 需要 Box<dyn> 存进注册表，原生 async fn in trait 不支持
+# dyn 兼容，用 async-trait 宏生成 Box<dyn Future> 签名
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 # HTTP 传输（ADR-0001）：json 发请求体，stream 拿 SSE 字节流；默认 TLS（Windows 走 schannel）
 reqwest = { version = "0.12", features = ["json", "stream"] }
