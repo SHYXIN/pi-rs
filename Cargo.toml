@@ -1,0 +1,18 @@
+[package]
+name = "pi-rs"
+version = "0.1.0"
+edition = "2021"
+description = "A coding agent in Rust, modeled after pi (TypeScript)"
+
+[dependencies]
+# 异步运行时唯一选型 tokio（ADR-0001），SSE/工具并发在后续 ticket 使用
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 错误处理选 thiserror 而非 anyhow：config 等模块是库代码，调用方（后续 agent loop）
+# 需要区分「配置缺失 / 解析失败 / 模型不存在」等可匹配的错误变体，而非笼统的应用错误
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
