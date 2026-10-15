@@ -43,6 +43,27 @@ impl Connection {
     pub fn api_key(&self) -> &str {
         &self.api_key
     }
+
+    /// 测试专用：任意构造连接三元组（密钥安全不受影响——本函数只该在测试里用）
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        Self {
+            model_id: String::new(),
+            endpoint: String::new(),
+            api_key: String::new(),
+        }
+    }
+
+    /// 跨 crate 测试（integration/集成测试）构造：pub 但带 cfg(test) 之外的显式命名，
+    /// 供 provider mock 测试使用；api_key 走 setter 保持在 Debug 脱敏路径上。
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_parts(model_id: &str, endpoint: &str, api_key: &str) -> Self {
+        Self {
+            model_id: model_id.to_string(),
+            endpoint: endpoint.to_string(),
+            api_key: api_key.to_string(),
+        }
+    }
 }
 
 /// 手写 Debug：只打印 endpoint 与 model，绝不打印 key 明文

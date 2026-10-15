@@ -13,6 +13,12 @@ serde_json = "1"
 # 需要区分「配置缺失 / 解析失败 / 模型不存在」等可匹配的错误变体，而非笼统的应用错误
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
+# HTTP 传输（ADR-0001）：json 发请求体，stream 拿 SSE 字节流；默认 TLS（Windows 走 schannel）
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# 仅用 StreamExt 消费 reqwest 的 bytes_stream；不开默认特性避免多余的 futures 全集
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
+# mock HTTP server：断言请求体形状 + 回放预录 SSE（验收要求，不烧真 token）
+wiremock = "0.6"
