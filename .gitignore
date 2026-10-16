@@ -2,3 +2,9 @@
 .env
 .env.*
 *.key
+
+# Rust
+/target
+
+# 模型配置可能含真实 key，任何本地副本不得入库
+models.json
