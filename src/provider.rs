@@ -592,7 +592,6 @@ mod tests {
     // ---------- ticket 03 验收：mock server 集成测试 ----------
 
     use crate::config::Connection;
-    use futures_util::StreamExt as _;
 
     /// 构造指向 mock server 的 Connection
     fn connection_to(uri: &str) -> Connection {
@@ -733,9 +732,9 @@ mod tests {
             .respond_with(|_req: &wiremock::Request| {
                 // 只有文本增量，没有 [DONE] 就断流
                 wiremock::ResponseTemplate::new(200)
-                    .set_body_string(concat!(
-                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"
-                    ))
+                    .set_body_string(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+                    )
             })
             .mount(&server)
             .await;
@@ -753,7 +752,7 @@ mod tests {
     #[tokio::test]
     async fn tool_call_messages_round_trip_through_request_body() {
         let server = wiremock::MockServer::start().await;
-        let mocked = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(|_req: &wiremock::Request| {
                 wiremock::ResponseTemplate::new(200)
                     .set_body_string("data: [DONE]\n\n")
