@@ -2,8 +2,6 @@
 
 use std::collections::HashMap;
 
-use async_trait::async_trait;
-
 use super::{ToolContext, ToolExecutor, ToolOutput};
 
 /// 注册表中的条目：工具声明（暴露给 LLM 的元数据）+ 执行器。
@@ -132,25 +130,13 @@ pub fn default_registry() -> ToolRegistry {
     reg
 }
 
-/// 注册表的执行入口本质上就是 ToolExecutor（方便把整个注册表当单个工具集使用）。
-#[async_trait]
-impl ToolExecutor for ToolRegistry {
-    fn name(&self) -> &str {
-        "registry"
-    }
-
-    async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> ToolOutput {
-        ToolOutput::ExecutionError(
-            "execute a tool by calling `ToolRegistry::execute(name, args, ctx)` with a tool name, not the registry itself".to_string(),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tool::{ReadTool, Tool, WriteTool};
     use serde_json::json;
+
+    use async_trait::async_trait;
 
     #[test]
     fn default_registry_has_complete_five_tools() {

@@ -47,10 +47,10 @@ async fn real_model_completes_read_edit_test_task() {
     )
     .unwrap();
 
-    let provider = OpenAiProvider::new(conn);
-    let registry = default_registry();
+    let provider = std::sync::Arc::new(OpenAiProvider::new(conn));
+    let registry = std::sync::Arc::new(default_registry());
     let ctx = ToolContext::new(&proj);
-    let loop_ = AgentLoop::new(&provider, &registry, ctx);
+    let loop_ = AgentLoop::new(provider, registry, ctx);
 
     let mut transcript = Transcript::new();
     transcript.push(Message::User {

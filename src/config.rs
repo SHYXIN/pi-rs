@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::tool::Tool;
-
 /// 默认模型 id（spec 指定）
 pub const DEFAULT_MODEL: &str = "glm-5.3-flash";
 
@@ -44,19 +42,11 @@ impl Connection {
         &self.api_key
     }
 
-    /// 测试专用：任意构造连接三元组（密钥安全不受影响——本函数只该在测试里用）
+    /// 测试专用：任意构造连接三元组（密钥安全不受影响——本函数只该在测试里用）。
+    /// 单元测试在本 crate 内（cfg(test)）；Cargo.toml 无 [features] 段，
+    /// 不设虚假的 test-util feature gate（hardening 修复：原 cfg 永不可开
+    /// 且触发 unexpected_cfgs lint）。
     #[cfg(test)]
-    pub fn for_tests() -> Self {
-        Self {
-            model_id: String::new(),
-            endpoint: String::new(),
-            api_key: String::new(),
-        }
-    }
-
-    /// 跨 crate 测试（integration/集成测试）构造：pub 但带 cfg(test) 之外的显式命名，
-    /// 供 provider mock 测试使用；api_key 走 setter 保持在 Debug 脱敏路径上。
-    #[cfg(any(test, feature = "test-util"))]
     pub fn with_parts(model_id: &str, endpoint: &str, api_key: &str) -> Self {
         Self {
             model_id: model_id.to_string(),
@@ -159,44 +149,6 @@ pub fn load_connection(path: &Path, model_id: &str) -> Result<Connection, Config
     })
 }
 
-/// 第一版工具集声明（GLOSSARY.md First Version Boundary：read/bash/edit/write/grep）。
-/// schema 细化在后续 ticket；此处给出满足 function calling 结构的最小声明。
-pub fn default_tools() -> Vec<Tool> {
-    let object_schema = |props: &[(&str, &str)]| {
-        serde_json::json!({
-            "type": "object",
-            "properties": props.iter().map(|(n, d)| (n.to_string(), serde_json::json!({"type": "string", "description": d}))).collect::<serde_json::Map<String, serde_json::Value>>()
-        })
-    };
-    vec![
-        Tool {
-            name: "read".into(),
-            description: "Read a file's content from disk".into(),
-            parameters: object_schema(&[("path", "File path to read")]),
-        },
-        Tool {
-            name: "bash".into(),
-            description: "Run a shell command and return its output".into(),
-            parameters: object_schema(&[("command", "The shell command to run")]),
-        },
-        Tool {
-            name: "edit".into(),
-            description: "Edit a file by string replacement".into(),
-            parameters: object_schema(&[("path", "File path"), ("old", "Text to replace"), ("new", "Replacement text")]),
-        },
-        Tool {
-            name: "write".into(),
-            description: "Write content to a file".into(),
-            parameters: object_schema(&[("path", "File path"), ("content", "Content to write")]),
-        },
-        Tool {
-            name: "grep".into(),
-            description: "Search a pattern in files".into(),
-            parameters: object_schema(&[("pattern", "Regex pattern"), ("path", "Directory or file to search")]),
-        },
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,14 +221,5 @@ mod tests {
         let dbg = format!("{conn:?}");
         assert!(!dbg.contains("sk-test-fake-key"), "Debug leaked key: {dbg}");
         assert!(dbg.contains("<redacted>"));
-    }
-
-    #[test]
-    fn default_tools_are_well_formed() {
-        let tools = default_tools();
-        assert_eq!(tools.len(), 5);
-        assert!(tools.iter().all(|t| t.is_well_formed()));
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["read", "bash", "edit", "write", "grep"]);
     }
 }

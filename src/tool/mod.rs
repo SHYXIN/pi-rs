@@ -8,7 +8,7 @@
 //!
 //! 第一版边界内的五个工具（read/bash/edit/write/grep）已全部实现并
 //! 接入注册表；schema 声明与实现同文件演进（各工具的 `declaration()`），
-//! `crate::config::default_tools()` 保留为兼容入口。
+//! 一步式构建入口是 `registry::default_registry()`。
 
 mod bash;
 mod edit;
@@ -80,6 +80,29 @@ impl ToolOutput {
             ToolOutput::Success(s) => Some(s),
             _ => None,
         }
+    }
+}
+
+/// ToolOutput → 回传 LLM 的 ToolResult 消息（agent loop 与 REPL 共用的
+/// 单一映射，hardening 修复：此前 agent.rs / repl.rs 各抄一份 4 臂 match）。
+///
+/// 校验失败 / 执行失败 / 注册表级错误（未知工具名等）一律转成
+/// is_error=true 的 ToolResult 回传模型（模型可自行纠正重试），
+/// 循环不因此中断。
+pub fn into_tool_result(
+    output: Result<ToolOutput, ToolRegistryError>,
+    call_id: &str,
+) -> crate::transcript::Message {
+    let (content, is_error) = match output {
+        Ok(ToolOutput::Success(text)) => (text, false),
+        Ok(ToolOutput::ValidationFailed(msg)) => (msg, true),
+        Ok(ToolOutput::ExecutionError(msg)) => (msg, true),
+        Err(e) => (e.to_string(), true),
+    };
+    crate::transcript::Message::ToolResult {
+        call_id: call_id.to_string(),
+        content,
+        is_error,
     }
 }
 

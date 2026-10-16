@@ -10,7 +10,7 @@
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ValidationError {
     #[error("invalid arguments for tool `{tool}`: arguments must be a JSON object, got {got}")]
-    NotAnObject { tool: String, got: &'static str },
+    NotAnObject { tool: String, got: String },
     #[error(
         "invalid arguments for tool `{tool}`: missing required field `{field}` (type: {expected})"
     )]
@@ -47,7 +47,7 @@ const KNOWN_TYPES: [&str; 7] = [
 pub fn validate_args(tool: &str, schema: &serde_json::Value, args: &serde_json::Value) -> Result<(), ValidationError> {
     let obj = args.as_object().ok_or_else(|| ValidationError::NotAnObject {
         tool: tool.to_string(),
-        got: json_type_name(args),
+        got: json_type_name(args).to_string(),
     })?;
     let _ = obj;
 
@@ -56,7 +56,7 @@ pub fn validate_args(tool: &str, schema: &serde_json::Value, args: &serde_json::
         None => {
             return Err(ValidationError::NotAnObject {
                 tool: tool.to_string(),
-                got: json_type_name(schema),
+                got: json_type_name(schema).to_string(),
             })
         }
     };
@@ -65,7 +65,7 @@ pub fn validate_args(tool: &str, schema: &serde_json::Value, args: &serde_json::
         Some(other) => {
             return Err(ValidationError::NotAnObject {
                 tool: tool.to_string(),
-                got: Box::leak(other.to_string().into_boxed_str()),
+                got: other.to_string(),
             })
         }
     }

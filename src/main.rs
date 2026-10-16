@@ -44,12 +44,15 @@ fn main() {
     println!("endpoint    : {}", conn.endpoint);
     println!();
 
-    let provider = OpenAiProvider::new(conn);
-    let registry = default_registry();
+    // Arc 包装：REPL 把 AgentLoop 调用放进 spawned 任务（'static 边界）
+    let provider = std::sync::Arc::new(OpenAiProvider::new(conn));
+    let registry = std::sync::Arc::new(default_registry());
     // 工具工作目录 = 进程启动目录；相对路径以此解析
     let ctx = ToolContext::new(".");
 
-    if let Err(e) = repl::run_session(provider, registry, ctx) {
+    // beforeToolCall 拦截点：第一版默认放行（传 None）；权限系统接入时
+    // 在这里构造 BeforeToolCallHook 传入
+    if let Err(e) = repl::run_session(provider, registry, ctx, None) {
         eprintln!("error: {e}");
         std::process::exit(1);
     }

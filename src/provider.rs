@@ -193,9 +193,6 @@ pub trait Provider {
     /// HTTP 状态错误在首个 poll 即给出（本方法内同步检查），流中断错误
     /// 以 `Err(ProviderError::StreamTruncated)` 作为流的最后一个 item。
     fn stream(&self, transcript: &Transcript, tools: &[Tool]) -> impl Future<Output = Result<EventStream>> + Send;
-    /// 各实现自己的流类型（RPITIT 的伴生类型写法，避免 trait 关联类型带来的
-    /// 额外泛型参数；实现直接内联具体类型）
-    type Stream;
 }
 
 /// 统一 Message → OpenAI chat/completions 请求条目。
@@ -269,8 +266,6 @@ impl OpenAiProvider {
 }
 
 impl Provider for OpenAiProvider {
-    type Stream = Pin<Box<dyn futures_util::Stream<Item = Result<ProviderEvent>> + Send>>;
-
     fn stream(&self, transcript: &Transcript, tools: &[Tool]) -> impl Future<Output = Result<EventStream>> + Send {
         let body = build_request_body(transcript, tools, &self.model);
         let http = self.http.clone();

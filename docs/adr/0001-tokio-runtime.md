@@ -20,4 +20,4 @@ pi-rs 的核心路径是网络密集型：调用 LLM API 并消费 SSE 流式响
 
 - 全库统一 tokio，不引入其他运行时。
 - SSE 流式解析基于 reqwest 的 bytes_stream 手写增量解析（OpenAI `data:` 行协议足够简单，不引第三方 eventsource 库，减少一层黑盒）。
-- 工具并发执行用 `tokio::spawn` + join。
+- 工具并发执行用 `futures_util::future::join_all` 在同一任务内并发（修订 2026-10-16，hardening：实现实际采用 join_all 而非本条原先写的 `tokio::spawn` + join——工具执行无需跨任务并行，spawn 反而引入生命周期与取消的额外复杂度；REPL 的 Ctrl+C 中断由调用方任务 abort 整体承担）。

@@ -8,17 +8,23 @@
 //! 语义对齐 pi 的同名 hook；为后续权限系统预留 seam（届时把"放行/拒绝"的
 //! 决策来源从闭包换成权限服务即可，循环侧接口不变）。
 //!
+//! 流式消费有两个入口：`run()` 内部静默消费事件流；`run_with_events()` 把
+//! 每个事件（含工具调用开始/结果）经 `AgentEvent` 回调外送——REPL 的流式
+//! 渲染就挂在这个回调上，不再自己复刻一份循环语义（hardening 修复：此前
+//! repl.rs 复制了本文件的聚合/执行/错误处理三段逻辑，修一处漏一处）。
+//!
 //! 测试策略：脚本化 FakeProvider 直接实现 `Provider` trait，重放预编排的
 //! 事件序列，不碰网络。放在本文件 `#[cfg(test)]` 而非独立 test-util 文件：
 //! 它是循环测试的专属脚手架（依赖事件构造 helper），与 loop 同文件内聚最简，
 //! 未来若多模块复用再拆出。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 
 use crate::provider::{Event, Provider, ProviderError, ProviderEvent};
-use crate::tool::{ToolContext, ToolOutput, ToolRegistry};
+use crate::tool::{ToolContext, ToolRegistry};
 use crate::transcript::{Message, Transcript};
 
 /// 单次会话允许的最大循环轮数（一次 provider 调用 + 工具执行 = 一轮）。
@@ -68,31 +74,111 @@ pub struct AgentRun {
     pub transcript: Transcript,
 }
 
-/// 单轮回复的中间形态：拼接后的文本 + 聚合完成的工具调用（可能为空）。
-struct PendingReply {
-    text: String,
-    /// None：本轮回复没有工具调用（终止信号）；Some：聚合好的调用列表
-    tool_calls: Option<Vec<PendingToolCall>>,
+/// 聚合完成的一次工具调用（从流式碎片归并而来）。
+///
+/// pub 供 repl.rs 等流式消费方复用（hardening：原先私有，repl 被迫自己
+/// 定义同构 tuple，属于重复定义）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
-struct PendingToolCall {
-    call_id: String,
-    name: String,
-    arguments: serde_json::Value,
+/// 流式 ToolCallDelta 碎片聚合器（GLOSSARY.md：Tool Call 跨 delta 到达）。
+///
+/// 聚合规则（单一事实来源，agent loop 与 REPL 渲染共用）：
+/// - index 标识并行调用槽位；id/name 取首个非空出现，后续碎片为 None
+/// - 参数为 JSON 字符串碎片，按序拼接后整体 parse；坏 JSON 不 panic——
+///   原始碎片文本作为字符串参数兜底，让下游校验给出可回传模型的错误
+#[derive(Debug, Default)]
+pub struct ToolCallAggregator {
+    /// index → (call_id, name, arguments_buffer)；BTreeMap 保 key 序稳定，测试断言可预测
+    slots: BTreeMap<usize, (Option<String>, Option<String>, String)>,
+}
+
+impl ToolCallAggregator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂入一个 provider 事件。TextDelta / Done 被忽略（只关心工具调用碎片）。
+    pub fn on_event(&mut self, event: &Event) {
+        if let Event::ToolCallDelta {
+            index,
+            id,
+            name,
+            arguments_delta,
+        } = event
+        {
+            let slot = self.slots.entry(*index).or_default();
+            if slot.0.is_none() {
+                slot.0.clone_from(id);
+            }
+            if slot.1.is_none() {
+                slot.1.clone_from(name);
+            }
+            if let Some(frag) = arguments_delta {
+                slot.2.push_str(frag);
+            }
+        }
+    }
+
+    /// 流结束调用：返回聚合好的调用列表；None = 本轮回复没有工具调用。
+    pub fn finish(self) -> Option<Vec<ToolCall>> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut calls = Vec::with_capacity(self.slots.len());
+        for (_, (call_id, name, args_buf)) in self.slots {
+            let arguments: serde_json::Value = serde_json::from_str(&args_buf)
+                .unwrap_or_else(|_| serde_json::Value::String(args_buf.clone()));
+            calls.push(ToolCall {
+                call_id: call_id.unwrap_or_default(),
+                name: name.unwrap_or_default(),
+                arguments,
+            });
+        }
+        Some(calls)
+    }
+}
+
+/// `run_with_events` 外送的事件：流式增量 + 工具调用生命周期。
+///
+/// 借用而非克隆：回调是同步热路径（REPL 渲染），事件数据生命周期只覆盖
+/// 回调调用期间，无需所有权。
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentEvent<'a> {
+    /// provider 流的原始增量（文本/工具调用碎片/完成信号）
+    Stream(&'a Event),
+    /// 一次工具调用即将执行（已过 beforeToolCall 拦截）
+    ToolCallStarted {
+        name: &'a str,
+        arguments: &'a serde_json::Value,
+    },
+    /// 一次工具调用执行完毕
+    ToolResult {
+        call_id: &'a str,
+        content: &'a str,
+        is_error: bool,
+    },
 }
 
 /// 中央 Agent Loop（GLOSSARY.md）。
 ///
 /// 泛型参数 P 为 provider 实现（RPITIT 静态分发，见 provider.rs 注释）。
-pub struct AgentLoop<'a, P: Provider> {
-    provider: &'a P,
-    registry: &'a ToolRegistry,
+/// 字段用 Arc：REPL 把 loop 调用放进 spawned 任务（'static），Arc 化让
+/// 所有权的克隆跨越任务边界（hardening：原先字段是引用，REPL 因此被迫
+/// 自建循环）。
+pub struct AgentLoop<P: Provider> {
+    provider: Arc<P>,
+    registry: Arc<ToolRegistry>,
     ctx: ToolContext,
     before_tool_call: Option<BeforeToolCallHook>,
 }
 
-impl<'a, P: Provider> AgentLoop<'a, P> {
-    pub fn new(provider: &'a P, registry: &'a ToolRegistry, ctx: ToolContext) -> Self {
+impl<P: Provider> AgentLoop<P> {
+    pub fn new(provider: Arc<P>, registry: Arc<ToolRegistry>, ctx: ToolContext) -> Self {
         Self {
             provider,
             registry,
@@ -112,11 +198,24 @@ impl<'a, P: Provider> AgentLoop<'a, P> {
     ///
     /// transcript 会被原地追加（assistant 回复、tool call、tool result）。
     pub async fn run(&self, transcript: &mut Transcript) -> Result<AgentRun> {
+        self.run_with_events(transcript, &mut |_| {}).await
+    }
+
+    /// `run` 的观察者版本：每个流式事件 / 工具调用生命周期节点都回调
+    /// `on_event`（如 REPL 流式渲染）。行为（终止条件 / 消息顺序 / 错误
+    /// 处理）与 `run` 完全一致——两者本就是同一份实现。
+    pub async fn run_with_events(
+        &self,
+        transcript: &mut Transcript,
+        on_event: &mut impl FnMut(AgentEvent<'_>),
+    ) -> Result<AgentRun> {
         let tools = self.registry.tools();
 
         for _ in 0..MAX_ITERATIONS {
             // —— 1. 调 provider，收集完整回复（文本增量拼接 + 工具调用聚合）——
-            let reply = self.collect_reply(transcript, &tools).await?;
+            let reply = self
+                .collect_reply(transcript, &tools, on_event)
+                .await?;
 
             // —— 2. 无工具调用 → 终止，返回最终回复 ——
             let Some(tool_calls) = reply.tool_calls else {
@@ -163,40 +262,35 @@ impl<'a, P: Provider> AgentLoop<'a, P> {
             // 每个调用独立校验 + 执行；校验失败/执行失败/未知工具都转成
             // is_error=true 的 ToolResult 回传模型（模型可自行纠正重试），
             // 循环不因此中断——只有 provider 层错误才跳出循环。
+            // ToolCallStarted 先同步回调；ToolResult 在 join_all 后按序回调
+            //（async 块捕获 FnMut 引用会与外层 map 闭包的 move 语义冲突，
+            // 事后回调同样满足「结果按调用顺序外送」）。
+            for call in &tool_calls {
+                on_event(AgentEvent::ToolCallStarted {
+                    name: &call.name,
+                    arguments: &call.arguments,
+                });
+            }
             let executions = tool_calls.iter().map(|call| {
                 let output = self.registry.execute(&call.name, call.arguments.clone(), &self.ctx);
                 async move {
-                    let result = match output.await {
-                        Ok(ToolOutput::Success(text)) => Message::ToolResult {
-                            call_id: call.call_id.clone(),
-                            content: text,
-                            is_error: false,
-                        },
-                        Ok(ToolOutput::ValidationFailed(msg)) => Message::ToolResult {
-                            call_id: call.call_id.clone(),
-                            content: msg,
-                            is_error: true,
-                        },
-                        Ok(ToolOutput::ExecutionError(msg)) => Message::ToolResult {
-                            call_id: call.call_id.clone(),
-                            content: msg,
-                            is_error: true,
-                        },
-                        // 未知工具名等注册表级错误：同样包装为错误 ToolResult
-                        Err(e) => Message::ToolResult {
-                            call_id: call.call_id.clone(),
-                            content: e.to_string(),
-                            is_error: true,
-                        },
-                    };
-                    (call.call_id.clone(), result)
+                    let call_id = call.call_id.clone();
+                    let result = crate::tool::into_tool_result(output.await, &call_id);
+                    (call_id, result)
                 }
             });
             let results = futures_util::future::join_all(executions).await;
 
             // 按工具调用顺序把结果追加进 transcript（校验失败也占一条，
             // 保证 tool_call 与 tool_result 一一对应，满足 OpenAI 协议约束）
-            for (_, message) in results {
+            for (call_id, message) in results {
+                if let Message::ToolResult { content, is_error, .. } = &message {
+                    on_event(AgentEvent::ToolResult {
+                        call_id: &call_id,
+                        content,
+                        is_error: *is_error,
+                    });
+                }
                 transcript.push(message);
             }
         }
@@ -204,68 +298,40 @@ impl<'a, P: Provider> AgentLoop<'a, P> {
         Err(AgentError::MaxIterations { max: MAX_ITERATIONS })
     }
 
-    /// 消费一次 provider 流：拼接文本增量、按 index 聚合工具调用碎片。
-    ///
-    /// 流式协议中同一个工具调用的 id/name/参数分多个 delta 到达（见
-    /// provider.rs 的 Event::ToolCallDelta 注释），这里按 index 归并：
-    /// id/name 取首个非空出现，参数字符串按序拼接后整体 parse。
+    /// 消费一次 provider 流：文本增量经回调外送，工具调用碎片交给
+    /// ToolCallAggregator（聚合规则单一来源，见其文档）。
     async fn collect_reply(
         &self,
         transcript: &Transcript,
         tools: &[crate::tool::Tool],
+        on_event: &mut impl FnMut(AgentEvent<'_>),
     ) -> Result<PendingReply> {
         let stream = self.provider.stream(transcript, tools).await?;
         futures_util::pin_mut!(stream);
 
         let mut text = String::new();
-        // index → (call_id, name, arguments_buffer)；BTreeMap 保 key 序稳定，测试断言可预测
-        let mut slots: std::collections::BTreeMap<usize, (Option<String>, Option<String>, String)> =
-            std::collections::BTreeMap::new();
+        let mut aggregator = ToolCallAggregator::new();
 
         while let Some(item) = stream.next().await {
-            match item? {
-                ProviderEvent::Event(Event::TextDelta { delta }) => text.push_str(&delta),
-                ProviderEvent::Event(Event::ToolCallDelta {
-                    index,
-                    id,
-                    name,
-                    arguments_delta,
-                }) => {
-                    let slot = slots.entry(index).or_default();
-                    if slot.0.is_none() {
-                        slot.0 = id;
-                    }
-                    if slot.1.is_none() {
-                        slot.1 = name;
-                    }
-                    if let Some(frag) = arguments_delta {
-                        slot.2.push_str(&frag);
-                    }
-                }
-                ProviderEvent::Event(Event::Done { .. }) => break,
+            let ProviderEvent::Event(event) = item?;
+            on_event(AgentEvent::Stream(&event));
+            match &event {
+                Event::TextDelta { delta } => text.push_str(delta),
+                Event::ToolCallDelta { .. } => aggregator.on_event(&event),
+                Event::Done { .. } => break,
             }
         }
 
-        let tool_calls = if slots.is_empty() {
-            None
-        } else {
-            let mut calls = Vec::with_capacity(slots.len());
-            for (_, (call_id, name, args_buf)) in slots {
-                // 参数碎片理论上拼出合法 JSON；坏 JSON 不 panic——
-                // 把原始碎片文本作为字符串参数兜底，让下游校验给出可回传模型的错误
-                let arguments: serde_json::Value = serde_json::from_str(&args_buf)
-                    .unwrap_or_else(|_| serde_json::Value::String(args_buf.clone()));
-                calls.push(PendingToolCall {
-                    call_id: call_id.unwrap_or_default(),
-                    name: name.unwrap_or_default(),
-                    arguments,
-                });
-            }
-            Some(calls)
-        };
-
+        let tool_calls = aggregator.finish();
         Ok(PendingReply { text, tool_calls })
     }
+}
+
+/// 单轮回复的中间形态：拼接后的文本 + 聚合完成的工具调用（可能为空）。
+struct PendingReply {
+    text: String,
+    /// None：本轮回复没有工具调用（终止信号）；Some：聚合好的调用列表
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[cfg(test)]
@@ -274,7 +340,6 @@ mod tests {
     use crate::provider::EventStream;
     use crate::tool::Tool;
     use std::future::Future;
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -319,9 +384,6 @@ mod tests {
     }
 
     impl Provider for FakeProvider {
-        type Stream =
-            Pin<Box<dyn futures_util::Stream<Item = crate::provider::Result<ProviderEvent>> + Send>>;
-
         fn stream(
             &self,
             transcript: &Transcript,
@@ -409,18 +471,18 @@ mod tests {
             &self.name
         }
 
-        async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolOutput {
+        async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> crate::tool::ToolOutput {
             if self.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
             }
-            ToolOutput::Success(
+            crate::tool::ToolOutput::Success(
                 args.get("echo").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             )
         }
     }
 
     /// 注册 echo（立即）与 slow_echo（延迟 80ms）两个工具。
-    fn echo_registry() -> ToolRegistry {
+    fn echo_registry() -> Arc<ToolRegistry> {
         let mut reg = ToolRegistry::new();
         let schema = || {
             serde_json::json!({
@@ -443,11 +505,15 @@ mod tests {
             Arc::new(EchoExecutor { name: "slow_echo".into(), delay_ms: 80 }),
         )
         .unwrap();
-        reg
+        Arc::new(reg)
     }
 
     fn ctx() -> ToolContext {
         ToolContext::new(".")
+    }
+
+    fn provider_arc(script: Vec<Script>) -> Arc<FakeProvider> {
+        Arc::new(FakeProvider::new(script))
     }
 
     fn transcript_with_user(text: &str) -> Transcript {
@@ -462,9 +528,9 @@ mod tests {
 
     #[tokio::test]
     async fn reply_without_tool_call_terminates_and_returns_final_reply() {
-        let provider = FakeProvider::new(vec![Script::Text("all done")]);
+        let provider = provider_arc(vec![Script::Text("all done")]);
         let registry = echo_registry();
-        let loop_ = AgentLoop::new(&provider, &registry, ctx());
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx());
 
         let mut transcript = transcript_with_user("hi");
         let run = loop_.run(&mut transcript).await.unwrap();
@@ -485,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_tool_call_executes_then_loop_continues_to_final_reply() {
-        let provider = FakeProvider::new(vec![
+        let provider = provider_arc(vec![
             Script::ToolCalls {
                 text: "let me check",
                 calls: vec![call("call_1", "echo", serde_json::json!({"echo": "ping"}))],
@@ -493,7 +559,7 @@ mod tests {
             Script::Text("got ping"),
         ]);
         let registry = echo_registry();
-        let loop_ = AgentLoop::new(&provider, &registry, ctx());
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx());
 
         let mut transcript = transcript_with_user("say ping");
         let run = loop_.run(&mut transcript).await.unwrap();
@@ -543,7 +609,7 @@ mod tests {
     async fn multiple_tool_calls_run_in_parallel_and_results_append_in_order() {
         // slow_echo 先发出、echo 后发出：串行执行总时长 ≥80ms；
         // 并发执行 <80ms（echo 不等 slow_echo）。结果顺序仍按调用顺序。
-        let provider = FakeProvider::new(vec![
+        let provider = provider_arc(vec![
             Script::ToolCalls {
                 text: "two calls",
                 calls: vec![
@@ -554,7 +620,7 @@ mod tests {
             Script::Text("both done"),
         ]);
         let registry = echo_registry();
-        let loop_ = AgentLoop::new(&provider, &registry, ctx());
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx());
 
         let started = std::time::Instant::now();
         let mut transcript = transcript_with_user("go");
@@ -596,7 +662,7 @@ mod tests {
     async fn validation_failure_returns_error_tool_result_and_loop_continues() {
         // 第一轮：echo 参数缺 required 字段 → ValidationFailed
         // 第二轮：参数正确 → Success；第三轮：终止
-        let provider = FakeProvider::new(vec![
+        let provider = provider_arc(vec![
             Script::ToolCalls {
                 text: "oops missing field",
                 calls: vec![call("call_bad", "echo", serde_json::json!({}))],
@@ -608,7 +674,7 @@ mod tests {
             Script::Text("recovered"),
         ]);
         let registry = echo_registry();
-        let loop_ = AgentLoop::new(&provider, &registry, ctx());
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx());
 
         let mut transcript = transcript_with_user("echo please");
         let run = loop_.run(&mut transcript).await.unwrap();
@@ -645,7 +711,7 @@ mod tests {
     #[tokio::test]
     async fn execution_error_returns_error_tool_result_without_breaking_loop() {
         // read 一个不存在的文件 → ExecutionError（真实工具走完整链路）
-        let provider = FakeProvider::new(vec![
+        let provider = provider_arc(vec![
             Script::ToolCalls {
                 text: "read it",
                 calls: vec![call(
@@ -671,7 +737,11 @@ mod tests {
                 Arc::new(crate::tool::ReadTool),
             )
             .unwrap();
-        let loop_ = AgentLoop::new(&provider, &registry, ToolContext::new("."));
+        let loop_ = AgentLoop::new(
+            Arc::clone(&provider),
+            Arc::new(registry),
+            ToolContext::new("."),
+        );
 
         let mut transcript = transcript_with_user("read");
         let run = loop_.run(&mut transcript).await.unwrap();
@@ -690,7 +760,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_name_becomes_error_tool_result() {
-        let provider = FakeProvider::new(vec![
+        let provider = provider_arc(vec![
             Script::ToolCalls {
                 text: "calling something unregistered",
                 calls: vec![call("call_u", "nonexistent", serde_json::json!({}))],
@@ -698,7 +768,7 @@ mod tests {
             Script::Text("learned it is unknown"),
         ]);
         let registry = echo_registry();
-        let loop_ = AgentLoop::new(&provider, &registry, ctx());
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx());
 
         let mut transcript = transcript_with_user("go");
         let run = loop_.run(&mut transcript).await.unwrap();
@@ -717,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_arguments_json_becomes_error_tool_result_not_panic() {
         // 参数碎片拼出坏 JSON：兜底成字符串参数 → 校验失败 → 错误 ToolResult
-        let provider = FakeProvider::new(vec![
+        let provider = provider_arc(vec![
             Script::ToolCalls {
                 text: "",
                 calls: vec![ScriptedCall {
@@ -729,7 +799,7 @@ mod tests {
             Script::Text("survived bad json"),
         ]);
         let registry = echo_registry();
-        let loop_ = AgentLoop::new(&provider, &registry, ctx());
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx());
 
         let mut t = transcript_with_user("go");
         let run = loop_.run(&mut t).await.unwrap();
@@ -749,7 +819,7 @@ mod tests {
 
     #[tokio::test]
     async fn hook_absent_by_default_allows_everything() {
-        let provider = FakeProvider::new(vec![
+        let provider = provider_arc(vec![
             Script::ToolCalls {
                 text: "",
                 calls: vec![call("c1", "echo", serde_json::json!({"echo": "x"}))],
@@ -758,7 +828,7 @@ mod tests {
         ]);
         let registry = echo_registry();
         // 未注册 hook → 默认放行
-        let loop_ = AgentLoop::new(&provider, &registry, ctx());
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx());
         let mut t = transcript_with_user("go");
         let run = loop_.run(&mut t).await.unwrap();
         assert_eq!(run.final_reply, "end");
@@ -766,7 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn hook_can_inspect_call_and_allow() {
-        let provider = FakeProvider::new(vec![
+        let provider = provider_arc(vec![
             Script::ToolCalls {
                 text: "",
                 calls: vec![call("c1", "echo", serde_json::json!({"echo": "secret"}))],
@@ -777,7 +847,7 @@ mod tests {
 
         let observed: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
         let observed_in_hook = Arc::clone(&observed);
-        let loop_ = AgentLoop::new(&provider, &registry, ctx()).with_before_tool_call(Arc::new(
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx()).with_before_tool_call(Arc::new(
             move |name: &str, args: &serde_json::Value| {
                 observed_in_hook
                     .lock()
@@ -798,13 +868,13 @@ mod tests {
 
     #[tokio::test]
     async fn hook_deny_stops_loop_with_denied_by_hook_error() {
-        let provider = FakeProvider::new(vec![Script::ToolCalls {
+        let provider = provider_arc(vec![Script::ToolCalls {
             text: "",
             calls: vec![call("c1", "echo", serde_json::json!({"echo": "x"}))],
         }]);
         let registry = echo_registry();
 
-        let loop_ = AgentLoop::new(&provider, &registry, ctx()).with_before_tool_call(Arc::new(
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx()).with_before_tool_call(Arc::new(
             |_name: &str, _args: &serde_json::Value| HookDecision::Deny {
                 reason: "policy: echo is banned".into(),
             },
@@ -831,7 +901,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_turn_tool_chain_until_termination() {
-        let provider = FakeProvider::new(vec![
+        let provider = provider_arc(vec![
             Script::ToolCalls {
                 text: "step 1",
                 calls: vec![call("c1", "echo", serde_json::json!({"echo": "one"}))],
@@ -843,7 +913,7 @@ mod tests {
             Script::Text("chain finished"),
         ]);
         let registry = echo_registry();
-        let loop_ = AgentLoop::new(&provider, &registry, ctx());
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx());
 
         let mut t = transcript_with_user("run chain");
         let run = loop_.run(&mut t).await.unwrap();
@@ -870,9 +940,9 @@ mod tests {
             text: "",
             calls: vec![call("cx", "echo", serde_json::json!({"echo": "loop"}))],
         };
-        let provider = FakeProvider::new((0..MAX_ITERATIONS + 2).map(|_| infinite()).collect());
+        let provider = provider_arc((0..MAX_ITERATIONS + 2).map(|_| infinite()).collect());
         let registry = echo_registry();
-        let loop_ = AgentLoop::new(&provider, &registry, ctx());
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx());
 
         let mut t = transcript_with_user("loop forever");
         let err = loop_.run(&mut t).await.unwrap_err();
@@ -888,9 +958,6 @@ mod tests {
     async fn provider_error_propagates_out_of_loop() {
         struct BrokenProvider;
         impl Provider for BrokenProvider {
-            type Stream = Pin<
-                Box<dyn futures_util::Stream<Item = crate::provider::Result<ProviderEvent>> + Send>,
-            >;
             fn stream(
                 &self,
                 _transcript: &Transcript,
@@ -904,9 +971,105 @@ mod tests {
         }
 
         let registry = echo_registry();
-        let loop_ = AgentLoop::new(&BrokenProvider, &registry, ctx());
+        let loop_ = AgentLoop::new(Arc::new(BrokenProvider), Arc::clone(&registry), ctx());
         let mut t = transcript_with_user("go");
         let err = loop_.run(&mut t).await.unwrap_err();
         assert!(matches!(err, AgentError::Provider(_)), "{err:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // hardening：run_with_events 观察者回调
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_with_events_streams_lifecycle_callbacks() {
+        let provider = provider_arc(vec![
+            Script::ToolCalls {
+                text: "checking",
+                calls: vec![call("c1", "echo", serde_json::json!({"echo": "hi"}))],
+            },
+            Script::Text("final"),
+        ]);
+        let registry = echo_registry();
+        let loop_ = AgentLoop::new(Arc::clone(&provider), Arc::clone(&registry), ctx());
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_cb = Arc::clone(&seen);
+        let mut t = transcript_with_user("go");
+        let run = loop_
+            .run_with_events(&mut t, &mut |ev| match ev {
+                AgentEvent::Stream(Event::TextDelta { delta }) => {
+                    seen_in_cb.lock().unwrap().push(format!("text:{delta}"));
+                }
+                AgentEvent::ToolCallStarted { name, .. } => {
+                    seen_in_cb.lock().unwrap().push(format!("start:{name}"));
+                }
+                AgentEvent::ToolResult { call_id, is_error, .. } => {
+                    seen_in_cb.lock().unwrap().push(format!("result:{call_id}:{is_error}"));
+                }
+                AgentEvent::Stream(_) => {}
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(run.final_reply, "final");
+        let events = seen.lock().unwrap();
+        // 轮 1：文本 + start；工具执行后 result；轮 2：final 文本
+        assert!(events.contains(&"text:checking".to_string()), "{events:?}");
+        assert!(events.contains(&"start:echo".to_string()), "{events:?}");
+        assert!(events.contains(&"result:c1:false".to_string()), "{events:?}");
+        assert!(events.contains(&"text:final".to_string()), "{events:?}");
+        // start 先于 result（生命周期顺序）
+        let start = events.iter().position(|e| e == "start:echo").unwrap();
+        let result = events.iter().position(|e| e == "result:c1:false").unwrap();
+        assert!(start < result);
+    }
+
+    // ------------------------------------------------------------------
+    // hardening：ToolCallAggregator（聚合规则单一来源）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn aggregator_merges_fragmented_deltas_and_parses_arguments() {
+        let mut agg = ToolCallAggregator::new();
+        agg.on_event(&Event::TextDelta { delta: "ignored".into() });
+        agg.on_event(&Event::ToolCallDelta {
+            index: 0,
+            id: Some("c1".into()),
+            name: Some("read".into()),
+            arguments_delta: Some("{\"file".into()),
+        });
+        agg.on_event(&Event::ToolCallDelta {
+            index: 0,
+            id: None,
+            name: None,
+            arguments_delta: Some("_path\": \"a.txt\"}".into()),
+        });
+        agg.on_event(&Event::Done { finish_reason: None });
+
+        let calls = agg.finish().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id, "c1");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments, serde_json::json!({"file_path": "a.txt"}));
+    }
+
+    #[test]
+    fn aggregator_bad_json_falls_back_to_string_not_panic() {
+        let mut agg = ToolCallAggregator::new();
+        agg.on_event(&Event::ToolCallDelta {
+            index: 0,
+            id: Some("c1".into()),
+            name: Some("echo".into()),
+            arguments_delta: Some("{broken".into()),
+        });
+        let calls = agg.finish().unwrap();
+        assert_eq!(calls[0].arguments, serde_json::Value::String("{broken".into()));
+    }
+
+    #[test]
+    fn aggregator_empty_stream_finishes_to_none() {
+        let agg = ToolCallAggregator::new();
+        assert!(agg.finish().is_none());
     }
 }
