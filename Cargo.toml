@@ -18,6 +18,8 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 # HTTP 传输（ADR-0001）：json 发请求体，stream 拿 SSE 字节流；默认 TLS（Windows 走 schannel）
 reqwest = { version = "0.12", features = ["json", "stream"] }
+# REPL 行编辑（ticket 08）：多行输入 / 历史 / Ctrl+C 拦截都在这个 crate 内解决
+rustyline = "15"
 # grep 工具的正则引擎：纯 Rust 方案（不依赖 rg 子进程，Windows 无 rg 也能跑），见 src/tool/grep.rs 权衡注释
 regex = "1"
 # 仅用 StreamExt 消费 reqwest 的 bytes_stream；不开默认特性避免多余的 futures 全集

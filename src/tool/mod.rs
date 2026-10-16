@@ -22,7 +22,7 @@ pub use bash::BashTool;
 pub use edit::EditTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
-pub use registry::{ToolRegistry, ToolRegistryError};
+pub use registry::{default_registry, ToolRegistry, ToolRegistryError};
 pub use validate::{validate_args, ValidationError};
 pub use write::WriteTool;
 

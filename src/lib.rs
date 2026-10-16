@@ -5,5 +5,6 @@
 pub mod agent;
 pub mod config;
 pub mod provider;
+pub mod repl;
 pub mod tool;
 pub mod transcript;
